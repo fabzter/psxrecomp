@@ -45,6 +45,7 @@ set(_PSXRECOMP_TESTREG_DIR "${CMAKE_CURRENT_LIST_DIR}")
 # extra steps, which is the thing this file exists to prevent.
 set(PSXRECOMP_TESTS_NOT_REGISTERED
     "test_overlay_posix.c|built and run by tests/run_overlay_posix_test.sh, which stages the dlopen fixture tree; that script is registered as overlay_posix_test on UNIX"
+    "test_openxr_color_gl.c|real-GL fixture compiled and run by tests/run_openxr_color_gl.py (like test_gl_readback_region.c); not a ctest binary"
 )
 
 function(psxrecomp_check_all_tests_registered)
@@ -88,12 +89,20 @@ function(psxrecomp_check_all_tests_registered)
     # CONFIGURE_DEPENDS matters more than usual here: without it, ADDING a test
     # file would not re-run configure, so this check would sleep through the
     # exact event it exists to catch.
+    # The offline tools' unit tests live beside the tools (tools/tests,
+    # tools/, one level of tools/<package>/) and in the top-level tests/. They
+    # are registered in recompiler/CMakeLists.txt, the BIOS-free tree.
     file(GLOB _found CONFIGURE_DEPENDS
         "${_root}/runtime/tests/test_*.c"
         "${_root}/runtime/tests/test_*.cpp"
         "${_root}/runtime/tests/test_*.py"
         "${_root}/recompiler/tests/*_test.cpp"
-        "${_root}/recompiler/tests/test_*.py")
+        "${_root}/recompiler/tests/test_*.py"
+        "${_root}/tools/tests/test_*.py"
+        "${_root}/tools/test_*.py"
+        "${_root}/tools/*/test_*.py"
+        "${_root}/tests/test_*.py")
+    list(REMOVE_DUPLICATES _found)
 
     # ---- diff -------------------------------------------------------------
     set(_orphans "")

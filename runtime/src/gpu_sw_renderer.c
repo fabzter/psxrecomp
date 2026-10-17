@@ -99,6 +99,9 @@ static int g_raw_texture; /* 1 = skip modulation */
 
 /* Texture filtering: 0 = nearest (native PSX), 1 = bilinear. */
 static int g_texture_filter = 0;
+/* The player's filter request, applied unless faithful authority is on. */
+static int g_texture_filter_req = 0;
+static int g_faithful_authority = 0;   /* see sw_set_faithful_authority */
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                            */
@@ -163,19 +166,21 @@ static inline RTarget rt_hires(void) {
  * into the OTHER buffer's band in the shared wide surface and corrupt it
  * (top/bottom edge flicker as the buffers flip). Canonical VRAM never showed
  * this because its draw-area clip already confines it. Scale matches SSAA. */
+static int view_enabled, view_shift, view_pad_left, view_pad_right;
 static inline RTarget rt_wide(void) {
     int s = g_scale;
     RTarget t;
     t.buf = g_wide_cur;
     t.w = g_wide_w * s; t.h = VRAM_HEIGHT * s; t.s = s;
-    t.cx1 = 0;             t.cy1 = g_clip_y1 * s;
-    t.cx2 = g_wide_w * s - 1; t.cy2 = g_clip_y2 * s + (s - 1);
+    t.cx1 = view_pad_left * s; t.cy1 = g_clip_y1 * s;
+    t.cx2 = (g_wide_w - view_pad_right) * s - 1;
+    t.cy2 = g_clip_y2 * s + (s - 1);
     return t;
 }
 
 /* X-translation (native px) from canonical VRAM space into the active wide
  * surface: local_x = vram_x - base_x + OFFSET. */
-static inline int wide_dx(void) { return g_wide_off - g_wide_cur_base; }
+static inline int wide_dx(void) { return g_wide_off + view_shift - g_wide_cur_base; }
 
 /* Native-wide 2D-backdrop X-stretch (SW renderer), mirroring the GL
  * wide_set_bd_scale exactly. The far 2D backdrop (sprite-tagged tile grid: sky
@@ -444,7 +449,8 @@ static inline float bilinear_center_shift_for_target(const RTarget *t) {
 
 static void sw_tri_uv_limits(const int *xs, const int *ys,
                              const int *us, const int *vs) {
-    psx_uv_tri_limits(xs, ys, us, vs, g_uv_lim);
+    if (g_perspective_valid) psx_uv_tri_world_limits(us, vs, g_uv_lim);
+    else psx_uv_tri_limits(xs, ys, us, vs, g_uv_lim);
 }
 
 static void sw_rect_uv_limits(int u0, int v0, int u1, int v1) {
@@ -472,6 +478,13 @@ void sw_renderer_init(uint16_t *vram) {
     g_mod_r = g_mod_g = g_mod_b = 16; /* neutral = 128/8 = 16 (no modulation) */
     g_raw_texture = 0;
     g_texture_filter = 0;
+    g_texture_filter_req = 0;
+}
+
+/* Point the rasterizer at another VRAM array without touching any draw
+ * state (the OpenGL render thread switches its upload source this way). */
+void sw_renderer_rebind_vram(uint16_t *vram) {
+    g_vram = vram;
 }
 
 /* ------------------------------------------------------------------ */
@@ -506,11 +519,29 @@ void sw_renderer_set_scale(int scale) {
 
 int sw_renderer_scale(void) { return g_scale; }
 
+/* Faithful authority (netplay): while this rasterizer writes the guest's
+ * authoritative VRAM -- the netplay dual-raster SW@1x mirror or the netplay
+ * software GPU -- it draws exactly what hardware draws. The PGXP overrides and
+ * texture filtering are presentation enhancements; here they would put host-
+ * only state (PGXP shadows, which a rollback load drops on one peer only, and
+ * each player's Display filter) into pixels the game can read back with GP0
+ * C0 (V8:2 samples its own frame), forking guest RAM between peers. */
+void sw_set_faithful_authority(int on) {
+    g_faithful_authority = on ? 1 : 0;
+    g_texture_filter = g_faithful_authority ? 0 : g_texture_filter_req;
+    if (g_faithful_authority) {
+        g_precise_valid = 0;
+        g_perspective_valid = 0;
+    }
+}
+
+int sw_faithful_authority(void) { return g_faithful_authority; }
+
 void sw_set_precise_triangle(int enabled,
                              int32_t x0, int32_t y0,
                              int32_t x1, int32_t y1,
                              int32_t x2, int32_t y2) {
-    g_precise_valid = enabled ? 1 : 0;
+    g_precise_valid = (enabled && !g_faithful_authority) ? 1 : 0;
     g_precise_x16[0] = x0; g_precise_y16[0] = y0;
     g_precise_x16[1] = x1; g_precise_y16[1] = y1;
     g_precise_x16[2] = x2; g_precise_y16[2] = y2;
@@ -518,11 +549,14 @@ void sw_set_precise_triangle(int enabled,
 
 void sw_set_perspective_triangle(int enabled,
                                  float q0, float q1, float q2) {
-    g_perspective_valid = enabled && q0 > 0.0f && q1 > 0.0f && q2 > 0.0f;
+    const int requested = enabled && q0 > 0.0f && q1 > 0.0f && q2 > 0.0f;
+    g_perspective_valid = requested && !g_faithful_authority;
     g_perspective_q[0] = q0;
     g_perspective_q[1] = q1;
     g_perspective_q[2] = q2;
-    if (g_perspective_valid) g_perspective_triangles++;
+    /* Counts requests: under faithful authority the GPU presentation surface
+     * still draws them perspective-correct. */
+    if (requested) g_perspective_triangles++;
 }
 
 uint32_t sw_perspective_triangle_count(void) {
@@ -549,7 +583,10 @@ static inline void precise_consumed(void) {
     g_perspective_valid = 0;
 }
 
-void sw_set_texture_filter(int bilinear) { g_texture_filter = bilinear ? 1 : 0; }
+void sw_set_texture_filter(int bilinear) {
+    g_texture_filter_req = bilinear ? 1 : 0;
+    g_texture_filter = g_faithful_authority ? 0 : g_texture_filter_req;
+}
 int  sw_texture_filter(void) { return g_texture_filter; }
 
 /* ------------------------------------------------------------------ */
@@ -1768,6 +1805,16 @@ static uint16_t *wide_surf_for(int base_x) {
 
 /* Enable native-wide with a wide width + centering offset (native px), or
  * disable (wide_w <= 0). Re-allocates if the width changed. */
+void sw_wide_set_view(int enabled, int shift, int pad_left, int pad_right) {
+    if (!enabled) shift = pad_left = pad_right = 0;
+    if (view_enabled == enabled && view_shift == shift &&
+        view_pad_left == pad_left && view_pad_right == pad_right) return;
+    view_enabled = enabled;
+    view_shift = shift;
+    view_pad_left = pad_left;
+    view_pad_right = pad_right;
+}
+
 void sw_wide_configure(int wide_w, int offset) {
     if (wide_w <= 0) { wide_free_all(); g_wide_w = 0; g_wide_off = 0; return; }
     if (wide_w != g_wide_w) wide_free_all();

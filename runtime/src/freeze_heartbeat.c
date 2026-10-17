@@ -1,11 +1,13 @@
 /* freeze_heartbeat.c — see header for rationale. */
 
 #include "mdec.h"   /* mdec_recently_active: FMV parks the guest in BIOS MDEC code */
+#include "psx_memory.h"
 #include "freeze_heartbeat.h"
 #include "freeze_dump_policy.h"
 #include "debug_server.h"
 #include "crash_trace.h"   /* g_psx_fatal_reason */
 #include "cpu_state.h"     /* g_psx_bail_* call-contract counters */
+#include "starvation_ring.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -181,8 +183,9 @@ void freeze_heartbeat_set_paused(int paused) {
 /* Capture the main thread's call stack at the moment of a hard freeze.
  *
  * Called from the heartbeat thread when wedge_kind==1 (frame_count not
- * advancing). Suspends the main thread, walks its stack via StackWalk64,
- * symbolizes via SymFromAddr, then resumes. Each frame becomes a JSON
+ * advancing). Suspends the main thread, walks its PE unwind tables (x86
+ * falls back to StackWalk64), then
+ * resumes before symbol lookup and JSON output. Each frame becomes a JSON
  * object {addr, symbol?, displacement?, module?}.
  *
  * Best-effort: if DbgHelp init fails, dump an empty array and continue. */
@@ -193,15 +196,13 @@ static void freeze_dump_main_stack_json(FILE *f) {
      * must not walk the main thread — SuspendThread(self) parks forever. */
     if (GetCurrentThreadId() == s_main_thread_id) { fputs("[]", f); return; }
 
+#if !defined(_M_X64) && !defined(__x86_64__)
     if (!s_sym_initialized) {
         SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-        if (SymInitialize(GetCurrentProcess(), NULL, TRUE)) {
-            s_sym_initialized = 1;
-        } else {
-            fputs("[]", f);
-            return;
-        }
+        s_sym_initialized = SymInitialize(GetCurrentProcess(), NULL, TRUE) != FALSE;
+        if (!s_sym_initialized) { fputs("[]", f); return; }
     }
+#endif
 
     DWORD susp_count = SuspendThread(s_main_thread);
     if (susp_count == (DWORD)-1) { fputs("[]", f); return; }
@@ -210,27 +211,70 @@ static void freeze_dump_main_stack_json(FILE *f) {
     memset(&ctx, 0, sizeof(ctx));
     ctx.ContextFlags = CONTEXT_FULL;
     if (!GetThreadContext(s_main_thread, &ctx)) {
+        starvation_watchdog_heartbeat();
         ResumeThread(s_main_thread);
         fputs("[]", f);
         return;
     }
 
+#if !defined(_M_X64) && !defined(__x86_64__)
     STACKFRAME64 frame;
     memset(&frame, 0, sizeof(frame));
-#if defined(_M_X64) || defined(__x86_64__)
-    DWORD machine = IMAGE_FILE_MACHINE_AMD64;
-    frame.AddrPC.Offset = ctx.Rip;
-    frame.AddrFrame.Offset = ctx.Rbp;
-    frame.AddrStack.Offset = ctx.Rsp;
-#else
     DWORD machine = IMAGE_FILE_MACHINE_I386;
     frame.AddrPC.Offset = ctx.Eip;
     frame.AddrFrame.Offset = ctx.Ebp;
     frame.AddrStack.Offset = ctx.Esp;
-#endif
     frame.AddrPC.Mode = AddrModeFlat;
     frame.AddrFrame.Mode = AddrModeFlat;
     frame.AddrStack.Mode = AddrModeFlat;
+#endif
+
+    DWORD64 addresses[128];
+    unsigned count = 0;
+#if defined(_M_X64) || defined(__x86_64__)
+    /* PE unwind tables avoid DbgHelp's deferred symbol loading while the
+     * game is stopped. That loading can take seconds for large AOT builds. */
+    for (; count < 128 && ctx.Rip; count++) {
+        MEMORY_BASIC_INFORMATION stack_page;
+        if (!VirtualQuery((const void *)(uintptr_t)ctx.Rsp, &stack_page,
+                          sizeof(stack_page)) || stack_page.State != MEM_COMMIT ||
+            (stack_page.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
+            ctx.Rsp + sizeof(DWORD64) >
+                (DWORD64)(uintptr_t)stack_page.BaseAddress + stack_page.RegionSize)
+            break;
+        addresses[count] = ctx.Rip;
+        DWORD64 base = 0, previous_sp = ctx.Rsp;
+        PRUNTIME_FUNCTION unwind = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
+        if (unwind) {
+            void *handler_data = NULL;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, unwind, &ctx,
+                             &handler_data, &establisher, NULL);
+        } else {
+            ctx.Rip = *(const DWORD64 *)(uintptr_t)ctx.Rsp;
+            ctx.Rsp += sizeof(DWORD64);
+        }
+        if (ctx.Rsp <= previous_sp) { count++; break; }
+    }
+#else
+    for (; count < 128; count++) {
+        if (!StackWalk64(machine, GetCurrentProcess(), s_main_thread, &frame,
+                         &ctx, NULL, SymFunctionTableAccess64, SymGetModuleBase64,
+                         NULL) || !frame.AddrPC.Offset) break;
+        addresses[count] = frame.AddrPC.Offset;
+    }
+#endif
+    /* Diagnostic suspension is deliberate host work, not guest starvation.
+     * Refresh before resuming so a slow DbgHelp walk cannot manufacture a
+     * watchdog exit in the first cycle charge after the game wakes. A real
+     * guest stall remains subject to the ordinary deadline after resumption. */
+    starvation_watchdog_heartbeat();
+    ResumeThread(s_main_thread);
+
+    if (!s_sym_initialized) {
+        SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        s_sym_initialized = SymInitialize(GetCurrentProcess(), NULL, TRUE) != FALSE;
+    }
 
     fputc('[', f);
     int first = 1;
@@ -240,27 +284,23 @@ static void freeze_dump_main_stack_json(FILE *f) {
     } sym_storage;
     SYMBOL_INFO *sym = &sym_storage.si;
 
-    for (int depth = 0; depth < 128; depth++) {
-        if (!StackWalk64(machine, GetCurrentProcess(), s_main_thread, &frame,
-                         &ctx, NULL, SymFunctionTableAccess64, SymGetModuleBase64,
-                         NULL)) {
-            break;
-        }
-        DWORD64 addr = frame.AddrPC.Offset;
-        if (!addr) break;
+    for (unsigned depth = 0; depth < count; depth++) {
+        DWORD64 addr = addresses[depth];
 
         memset(sym, 0, sizeof(SYMBOL_INFO));
         sym->SizeOfStruct = sizeof(SYMBOL_INFO);
         sym->MaxNameLen   = 511;
         DWORD64 displacement = 0;
-        BOOL got_sym = SymFromAddr(GetCurrentProcess(), addr, &displacement, sym);
+        BOOL got_sym = s_sym_initialized &&
+            SymFromAddr(GetCurrentProcess(), addr, &displacement, sym);
 
         IMAGEHLP_MODULE64 mod;
         memset(&mod, 0, sizeof(mod));
         mod.SizeOfStruct = sizeof(mod);
-        BOOL got_mod = SymGetModuleInfo64(GetCurrentProcess(), addr, &mod);
+        BOOL got_mod = s_sym_initialized &&
+            SymGetModuleInfo64(GetCurrentProcess(), addr, &mod);
 
-        fprintf(f, "%s{\"depth\":%d,\"addr\":\"0x%016llX\"",
+        fprintf(f, "%s{\"depth\":%u,\"addr\":\"0x%016llX\"",
                 first ? "" : ",", depth, (unsigned long long)addr);
         if (got_sym) {
             /* Escape JSON-special chars in symbol name (best-effort: bracket replace). */
@@ -291,7 +331,6 @@ static void freeze_dump_main_stack_json(FILE *f) {
     }
     fputc(']', f);
 
-    ResumeThread(s_main_thread);
 }
 
 /* Multi-sample stack capture for still-running wedges (wedge_kind 2 and 3).
@@ -348,10 +387,10 @@ static int hb_append_ram_peek(char *out, int n, size_t cap, uint32_t vaddr, int 
                 ncopy = (int)(0x400u - off);
         }
     } else if (phys < 0x00800000u && g_psx_ram) {
-        uint32_t folded = phys & 0x1FFFFFu;
+        uint32_t folded = psx_ram_canonical_offset(phys);
         src = g_psx_ram + folded;
-        if (folded + (uint32_t)ncopy > 0x200000u)
-            ncopy = (int)(0x200000u - folded);
+        if (folded + (uint32_t)ncopy > psx_ram_live_bytes())
+            ncopy = (int)(psx_ram_live_bytes() - folded);
     }
     if (!src) ncopy = 0;
     int m = snprintf(out + n, cap - (size_t)n,
@@ -377,7 +416,7 @@ static uint32_t hb_jal_target_from_ra(uint32_t ra) {
         uint8_t *sp = memory_get_scratchpad_ptr();
         if (sp) src = sp + (phys - 0x1F800000u);
     } else if (phys < 0x00800000u && g_psx_ram) {
-        src = g_psx_ram + (phys & 0x1FFFFFu);
+        src = g_psx_ram + psx_ram_canonical_offset(phys);
     }
     if (!src) return 0;
     memcpy(&insn, src, 4);
