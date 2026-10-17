@@ -45,6 +45,7 @@ extern uint64_t g_dirty_ram_blocks_run;
 extern uint64_t g_dirty_ram_insns_run;
 extern uint64_t g_dirty_pump_max_gap_insns;  /* largest insn gap between IRQ pumps */
 extern uint64_t g_dirty_pump_count;          /* region-independent dirty IRQ pumps */
+extern uint64_t g_dirty_ram_empty_irq_callback_returns;
 /* Timer/RootCounter debug accessor (timers.c) — Tomba 2 RCnt-wait diagnosis. */
 extern void timers_get_debug(int t, uint16_t *counter, uint16_t *target,
                              uint32_t *mode, uint64_t *irq_fired);
@@ -525,6 +526,7 @@ static int freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         "  \"dirty_ram_insns\":%llu,\n"
         "  \"dirty_pump_max_gap_insns\":%llu,\n"
         "  \"dirty_pump_count\":%llu,\n"
+        "  \"empty_irq_callback_returns\":%llu,\n"
         "  \"tcp_send_stall_ms\":%llu,\n"
         "  \"tcp_clients_dropped\":%u,\n"
         "  \"bail_first\":%llu,\n"
@@ -553,6 +555,7 @@ static int freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         (unsigned long long)g_dirty_ram_insns_run,
         (unsigned long long)g_dirty_pump_max_gap_insns,
         (unsigned long long)g_dirty_pump_count,
+        (unsigned long long)g_dirty_ram_empty_irq_callback_returns,
         (unsigned long long)debug_server_get_tcp_stall_ms(),
         debug_server_get_tcp_drops(),
         (unsigned long long)g_psx_bail_first,
@@ -899,6 +902,7 @@ static void heartbeat_write(void) {
         "  \"dirty_ram_insns\":%llu,\n"
         "  \"dirty_pump_max_gap_insns\":%llu,\n"
         "  \"dirty_pump_count\":%llu,\n"
+        "  \"empty_irq_callback_returns\":%llu,\n"
         "  \"t1_count\":%u,\n"
         "  \"t1_target\":%u,\n"
         "  \"t1_mode\":\"0x%04X\",\n"
@@ -962,6 +966,7 @@ static void heartbeat_write(void) {
         (unsigned long long)g_dirty_ram_insns_run,
         (unsigned long long)g_dirty_pump_max_gap_insns,
         (unsigned long long)g_dirty_pump_count,
+        (unsigned long long)g_dirty_ram_empty_irq_callback_returns,
         (unsigned)t1_count,
         (unsigned)t1_target,
         (unsigned)t1_mode,

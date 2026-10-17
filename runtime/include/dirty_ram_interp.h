@@ -201,6 +201,7 @@ extern uint64_t g_dirty_window_dispatches;  /* interp dispatches inside a
 extern uint64_t g_dirty_ram_aborts;         /* unsupported-opcode aborts */
 extern uint64_t g_dirty_ram_guard_yields;   /* long dirty loops yielded */
 extern uint64_t g_dirty_ram_unsupported_midblock;
+extern uint64_t g_dirty_ram_empty_irq_callback_returns;
 extern uint32_t g_dirty_ram_last_unsupported_entry;
 extern uint32_t g_dirty_ram_last_unsupported_entry_ra;
 extern uint32_t g_dirty_ram_last_unsupported_entry_sp;

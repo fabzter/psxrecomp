@@ -115,6 +115,7 @@ extern uint64_t crash_trace_unknown_seq_get(void);
 
 /* Dirty-RAM block log (defined in dirty_ram_interp.c). */
 #include "dirty_ram_interp.h"
+extern uint64_t g_dirty_ram_empty_irq_callback_returns;
 
 /* JSON helpers. Hand-rolled to avoid allocations on the SEH path. */
 
@@ -393,6 +394,7 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
         "  \"dispatch_depth\": %d,\n"
         "  \"last_func_addr\": \"0x%08X\",\n"
         "  \"last_store_pc\": \"0x%08X\",\n"
+        "  \"empty_irq_callback_returns\": %llu,\n"
         /* Dirty-RAM interpreter fail-closed detail. Without this, a run that
          * died on an undecodable instruction reported only cpu->pc == 0 — and
          * ten different sites set that, so the cause was unattributable. The
@@ -417,6 +419,7 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
         g_psx_dispatch_depth,
         g_debug_current_func_addr,
         g_debug_last_store_pc,
+        (unsigned long long)g_dirty_ram_empty_irq_callback_returns,
         (unsigned long long)g_dirty_ram_unsupported_midblock,
         g_dirty_ram_last_unsupported_pc,
         g_dirty_ram_last_unsupported_insn,

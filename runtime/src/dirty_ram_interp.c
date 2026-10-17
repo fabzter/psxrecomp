@@ -205,6 +205,7 @@ uint64_t g_pczero_count       = 0;
  * fields capture the most recent occurrence so a TCP query can see what
  * opcode is missing without needing log scraping. */
 uint64_t g_dirty_ram_unsupported_midblock = 0;
+uint64_t g_dirty_ram_empty_irq_callback_returns = 0;
 uint32_t g_dirty_ram_last_unsupported_entry = 0;
 uint32_t g_dirty_ram_last_unsupported_entry_ra = 0;
 uint32_t g_dirty_ram_last_unsupported_entry_sp = 0;
@@ -2968,6 +2969,16 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     uint32_t current_page = phys >> 12;
     int current_page_dirty = dirty_ram_is_dirty(phys);
     int insns_executed = 0;
+    int insns_all_nop = 1;
+    /* Stale-IRQ-callback recovery bookkeeping (see the g_unsupported_seen
+     * path): whether this interpreted entry executed any store, and the
+     * callee-saved registers the kernel's IRQ walker expects back. */
+    int insns_had_store = 0;
+    uint32_t entry_saved[11];
+    for (int sr_i = 0; sr_i < 8; sr_i++) entry_saved[sr_i] = cpu->gpr[16 + sr_i];
+    entry_saved[8]  = cpu->gpr[28];
+    entry_saved[9]  = cpu->gpr[29];
+    entry_saved[10] = cpu->gpr[30];
 #ifndef PSX_NO_DEBUG_TOOLS
     extern void debug_server_cyc_observe(uint32_t block_leader_phys);
 #endif
@@ -3042,6 +3053,13 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 #endif
         cosim_exec_one_begin();
         int transferred = exec_one_fetched(cpu, pc, insn, &next_pc);
+        if (!g_unsupported_seen && insn != 0u) insns_all_nop = 0;
+        if (!g_unsupported_seen) {
+            uint32_t st_op = insn >> 26;
+            /* sb/sh/swl/sw/swr, swc0..swc3 */
+            if ((st_op >= 0x28u && st_op <= 0x2Eu) || (st_op >= 0x38u && st_op <= 0x3Bu))
+                insns_had_store = 1;
+        }
 #ifndef PSX_NO_DEBUG_TOOLS
         /* Armed iff the window is NON-EMPTY, same as the callret ring: a `lo`
          * test made address 0 a silent off switch, so lo=0 with a real hi
@@ -3109,6 +3127,42 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                  * Hand off to psx_unknown_dispatch which has its own
                  * pattern-matching trampoline resolver. */
                 return 0;
+            }
+            /* A game can unregister an interrupt callback while its RAM slot
+             * is being cleared. The kernel's linked-list walker may already
+             * have loaded that callback address and still call into the now
+             * zero-filled slot. On R3000A, the first non-instruction after the
+             * NOP-filled slot raises RI; treating that as an ordinary nested
+             * RI makes games whose exception handler does not advance EPC
+             * loop forever at the stale callback. A call through JALR with an
+             * low-RAM body is an empty/stale kernel callback: return to its
+             * caller so the walker can continue to the next node. Keep the
+             * exception path for all other unsupported instructions/contexts.
+             *
+             * The body need not be pure NOPs: Final Bout's overlay clears the
+             * slot but leaves a table of 0x801Bxxxx pointers right behind it,
+             * which decode as harmless loads (lb) until a data word raises RI.
+             * What matters is that the stale body had no side effect beyond
+             * registers: no store was executed, and the callee-saved registers
+             * (s0-s7, gp, sp, fp) the walker relies on are restored from the
+             * entry snapshot before returning (counter:
+             * empty_irq_callback_returns).
+             */
+            uint32_t return_pc = cpu->gpr[31];
+            if (!insns_had_store && (addr & 0x1FFFFFFFu) >= 0x1000u &&
+                (addr & 0x1FFFFFFFu) < 0x10000u &&
+                (g_unsupported_pc & 0x1FFFFFFFu) < 0x10000u &&
+                (return_pc == 0x0000293Cu || return_pc == 0x00002950u)) {
+                g_dirty_ram_empty_irq_callback_returns++;
+                if (!insns_all_nop) {
+                    for (int sr_i = 0; sr_i < 8; sr_i++) cpu->gpr[16 + sr_i] = entry_saved[sr_i];
+                    cpu->gpr[28] = entry_saved[8];
+                    cpu->gpr[29] = entry_saved[9];
+                    cpu->gpr[30] = entry_saved[10];
+                }
+                cpu->gpr[2] = 0u;  /* empty callback: walker continues to next node */
+                cpu->pc = return_pc;
+                OV_FPLOG_RET1();
             }
             /* Made some progress, then hit unknown.  Treat as a no-op
              * return like psx_unknown_dispatch does for unrecognized
