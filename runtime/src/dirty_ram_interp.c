@@ -3413,12 +3413,21 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                 (g_unsupported_pc & 0x1FFFFFFFu) < 0x10000u &&
                 (return_pc == 0x0000293Cu || return_pc == 0x00002950u)) {
                 g_dirty_ram_empty_irq_callback_returns++;
+                /* Drain the stale body's last load BEFORE restoring saved
+                 * registers. OV_FPLOG_RET1 also drains it; doing that only
+                 * afterward can overwrite the restored s0-s7/gp/sp/fp. */
+                dirty_ram_ld_delay_flush(cpu);
                 if (!insns_all_nop) {
                     for (int sr_i = 0; sr_i < 8; sr_i++) cpu->gpr[16 + sr_i] = entry_saved[sr_i];
                     cpu->gpr[28] = entry_saved[8];
                     cpu->gpr[29] = entry_saved[9];
                     cpu->gpr[30] = entry_saved[10];
                 }
+                /* This fault has been consumed. A nested JALR can return to
+                 * an exec_one still on the host stack: leaving this flag set
+                 * makes that valid caller look undecodable (first-insn case)
+                 * or attributes the callee's fault to the caller mid-block. */
+                g_unsupported_seen = 0;
                 cpu->gpr[2] = 0u;  /* empty callback: walker continues to next node */
                 cpu->pc = return_pc;
                 OV_FPLOG_RET1();

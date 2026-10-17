@@ -265,6 +265,15 @@ if(BUILD_TESTING)
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mirror_pc_preserved_guards.py")
         add_test(NAME segment_miss_wiring_test COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_segment_miss_wiring.py")
+        # fixture_link needs a GNU toolchain (nm + GNU ld diagnostics), so this test
+        # uses a discovered GCC explicitly rather than ${CMAKE_C_COMPILER}, which may
+        # be clang whose ld.lld "duplicate symbol:" text the linker loop cannot parse.
+        find_program(PSX_FIXTURE_GCC NAMES gcc gcc.exe)
+        if(PSX_FIXTURE_GCC)
+            add_test(NAME irq_callback_recovery_test COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_irq_callback_recovery.py"
+                --cc "${PSX_FIXTURE_GCC}")
+        endif()
         if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
             add_test(NAME ws_screen_tags_exec_test COMMAND "${Python3_EXECUTABLE}"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ws_screen_tags_exec.py"
