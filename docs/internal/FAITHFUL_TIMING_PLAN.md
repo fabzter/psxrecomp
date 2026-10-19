@@ -213,6 +213,31 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-10-19 — DBFB R0: nonblocking worker completion, bounded evidence.**
+  `AC_DONE` is published before the Windows preparer returns; the watcher can
+  also still be alive. `autocompile_poll_main()` used unbounded joins from the
+  emulation/VBlank thread. A controlled event-held DONE interleaving blocked
+  the production publication test before the fix (12 s supervisor timeout).
+  Poll now tests both worker handles with timeout zero, retains DONE/resources
+  while either is alive, and finalizes exactly once after both exit. Shutdown
+  still owns blocking joins. The regression retains both workers separately,
+  and still checks 300 publications, bounded handoff and reference conservation.
+  Passive watchdog diagnostics now report max between-check wall/CPU/guest
+  gaps and eight host-maintenance sections in the existing final report.
+  No guest timing, heartbeats or watchdog thresholds changed. The production
+  watchdog tests still abort on 4.5 s host wait and heartbeat-starved busy work.
+  A real original-mode watchdog was reproduced BEFORE section attribution:
+  frame7236, wall5241554us/CPU1046875us/69625guestcycles, sampler0 and max DLL
+  load4744us. It is NOT causally attributed to the corrected DONE race.
+  Final local normal/PGXP builds, title offline check and 121 title Python/native
+  tests passed. Isolated final sessions: original600s/5 combats, renewed300s/3,
+  PGXP300s/2, all pause/save/load/normal quit and non-degraded autocompile PASS.
+  Nine pre-fix original600s sessions already passed (48 combats), so passing
+  soaks alone cannot establish a global R0 fix. Provider rescans still have
+  measured ~1.1–1.4 s costs. General WPR traces lost events (not causal proof);
+  reduced xperf CPU capture reported no loss but its session did not fail.
+  Changes remain local over835f1902; published title v0.2.0 is unchanged.
+
 - **2026-10-19 — DBFB release validation: scope and reopened host stall.**
   Windows suspension sampling now requires the exact opt-in
   `PSX_HOST_SAMPLER_SUSPEND=1`; default/invalid/enabled policy tests pass.

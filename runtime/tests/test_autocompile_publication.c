@@ -17,6 +17,8 @@ int autocompile_test_ready_count(void);
 int autocompile_test_ready_highwater(void);
 int autocompile_test_preparing_count(void);
 void autocompile_test_discard_all(void);
+void autocompile_test_hold_done(HANDLE seen, HANDLE release);
+int autocompile_test_set_watch_thread(HANDLE thread);
 
 struct OverlayPreparedImage {
     unsigned id;
@@ -28,6 +30,7 @@ static LONG s_committed;
 static LONG s_discarded;
 static LONG s_wrong_prepare_thread;
 static LONG s_wrong_commit_thread;
+static LONG s_rescans;
 
 OverlayPreparedImage *overlay_loader_prepare_published(const char *path) {
     OverlayPreparedImage *image =
@@ -53,7 +56,12 @@ void overlay_loader_discard_prepared(OverlayPreparedImage *image) {
     InterlockedIncrement(&s_discarded);
 }
 
-void overlay_loader_rescan(void) {}
+void overlay_loader_rescan(void) { InterlockedIncrement(&s_rescans); }
+
+static DWORD WINAPI delayed_watch_thread(void *release) {
+    WaitForSingleObject((HANDLE)release, INFINITE);
+    return 0;
+}
 
 typedef struct {
     const char *text;
@@ -181,6 +189,46 @@ int main(void) {
         return 1;
     }
 
+    /* DONE is published before the OS thread exits. Hold that exact
+     * interleaving: the emulator must keep running, not join the worker from
+     * its VBlank poll. No sleeps or timing-dependent race is needed. */
+    HANDLE done_seen = CreateEventA(NULL, TRUE, FALSE, NULL);
+    HANDLE done_release = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!done_seen || !done_release) return 1;
+    autocompile_test_hold_done(done_seen, done_release);
+    if (!autocompile_test_start_preparer()) return 1;
+    autocompile_test_finish_input();
+    if (WaitForSingleObject(done_seen, 3000) != WAIT_OBJECT_0) return 1;
+    LONG rescans_before = s_rescans;
+    autocompile_poll_main();  /* old code blocks here forever */
+    autocompile_status_json(status, sizeof(status));
+    if (!strstr(status, "\"state\":\"done\"")) {
+        fprintf(stderr, "FAIL: unfinished worker was finalized: %s\n", status);
+        return 1;
+    }
+    SetEvent(done_release);
+    if (!autocompile_test_join_preparer(3000)) return 1;
+    autocompile_test_hold_done(NULL, NULL);
+    HANDLE watch_release = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!watch_release) return 1;
+    HANDLE delayed_watch = CreateThread(NULL, 0, delayed_watch_thread, watch_release, 0, NULL);
+    if (!delayed_watch || !autocompile_test_set_watch_thread(delayed_watch)) return 1;
+    autocompile_poll_main();
+    autocompile_status_json(status, sizeof(status));
+    if (!strstr(status, "\"state\":\"done\"") || s_rescans != rescans_before ||
+        WaitForSingleObject(delayed_watch, 0) != WAIT_TIMEOUT) return 1;
+    SetEvent(watch_release);
+    if (WaitForSingleObject(delayed_watch, 3000) != WAIT_OBJECT_0) return 1;
+    autocompile_poll_main();
+    autocompile_status_json(status, sizeof(status));
+    if (!strstr(status, "\"state\":\"idle\"") || s_rescans != rescans_before + 1) return 1;
+    autocompile_poll_main();
+    if (s_rescans != rescans_before + 1) return 1;
+    CloseHandle(done_seen);
+    CloseHandle(done_release);
+    CloseHandle(watch_release);
+
+    puts("PASS: DONE-before-thread-exit never blocks the emulation poll");
     puts("PASS: publications prepare off-thread, backpressure at one mapped "
          "images, commit on the emulation thread, and shutdown conserves "
          "every prepared reference");

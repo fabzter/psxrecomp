@@ -43,6 +43,7 @@
 #include "crash_trace.h"
 #include "host_sampler.h"
 #include "overlay_loader.h"
+#include "starvation_ring.h"
 #include "psx_segment_miss.h"
 #include "autocompile.h"   /* autocompile_degraded_reason — stamp a degraded
                             * (interpreter-only) run into its own report */
@@ -441,6 +442,17 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
 
     uint64_t load_total_us = 0, load_max_us = 0, load_last_us = 0;
     overlay_loader_get_load_timing(&load_total_us, &load_max_us, &load_last_us);
+    StarvationWatchdogGap watchdog_gap;
+    starvation_watchdog_get_max_gap(&watchdog_gap);
+    append_fmt(buf, sizeof(buf), &pos,
+        "  \"watchdog_max_check_gap\": {\"wall_us\":%llu,\"cpu_us\":%llu,"
+        "\"guest_cycles\":%llu,\"cpu_time_available\":%d,"
+        "\"func_before\":\"0x%08X\",\"func_after\":\"0x%08X\"},\n",
+        (unsigned long long)watchdog_gap.wall_us,
+        (unsigned long long)watchdog_gap.cpu_us,
+        (unsigned long long)watchdog_gap.guest_cycles,
+        watchdog_gap.cpu_time_available, watchdog_gap.func_before,
+        watchdog_gap.func_after);
     append_fmt(buf, sizeof(buf), &pos,
         "  \"overlay_load_total_us\": %llu,\n"
         "  \"overlay_load_max_us\": %llu,\n"
@@ -448,6 +460,17 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
         (unsigned long long)load_total_us,
         (unsigned long long)load_max_us,
         (unsigned long long)load_last_us);
+    append_fmt(buf, sizeof(buf), &pos, "  \"watchdog_host_sections\": {");
+    for (unsigned section = 0; section < SW_HOST_SECTION_COUNT; section++) {
+        StarvationHostTiming timing;
+        starvation_watchdog_host_timing((StarvationHostSection)section, &timing);
+        append_fmt(buf, sizeof(buf), &pos,
+            "%s\"%s\":{\"calls\":%llu,\"total_us\":%llu,\"max_us\":%llu}",
+            section ? "," : "", starvation_watchdog_host_name((StarvationHostSection)section),
+            (unsigned long long)timing.calls, (unsigned long long)timing.total_us,
+            (unsigned long long)timing.max_us);
+    }
+    append_fmt(buf, sizeof(buf), &pos, "},\n");
 
     append_fmt(buf, sizeof(buf), &pos,
         "  \"host_sampler_max_suspend_us\": %llu,\n"

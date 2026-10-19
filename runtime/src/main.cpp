@@ -8671,6 +8671,14 @@ static bool local_mouse_live(int override_word) {
     return pad_ext_live(&g) != 0;
 }
 
+struct WatchdogHostSectionScope {
+    StarvationHostSection section;
+    uint64_t begin;
+    explicit WatchdogHostSectionScope(StarvationHostSection value)
+        : section(value), begin(starvation_watchdog_host_begin()) {}
+    ~WatchdogHostSectionScope() { starvation_watchdog_host_end(section, begin); }
+};
+
 static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     NetplayVblankEpilogue ep{};
     /* Guest quantum for this vblank is complete. Drop top-level-resume armed
@@ -8691,8 +8699,8 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     debug_server_set_fmv_quiet(mdec_recently_active(2));
     /* Debug server: pause gate, poll commands, record frame, check watchpoints. */
     debug_server_wait_if_paused();
-    debug_server_poll();
-    debug_server_record_frame();
+    { WatchdogHostSectionScope timing(SW_HOST_DEBUG_POLL); debug_server_poll(); }
+    { WatchdogHostSectionScope timing(SW_HOST_FRAME_RECORD); debug_server_record_frame(); }
     debug_server_check_watchpoints();
 
     /* Check debug server input override. */
@@ -8815,6 +8823,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * frontend is skipping presents. Both are cheap and emu-thread-only. */
     {
         uint64_t perf_start = runtime_perf_section_begin();
+        WatchdogHostSectionScope timing(SW_HOST_AUTOCAPTURE);
         overlay_autocapture_tick();
         runtime_perf_section_end(perf_start,
                                  &g_runtime_perf.autocapture_ticks);
@@ -8822,6 +8831,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     {   /* Apply a finished batch compile via the active code provider (gcc:
          * cache rescan on done). */
         uint64_t perf_start = runtime_perf_section_begin();
+        WatchdogHostSectionScope timing(SW_HOST_PROVIDER_POLL);
         const CodeProvider *cp = code_provider_active();
         if (cp->poll_main) cp->poll_main();
         runtime_perf_section_end(perf_start,
@@ -9024,6 +9034,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * Rollback resim: skip host audio pump (uncapped frames) so SPU/CD audio
      * paths cannot fork peers during the episode window. */
     if (!psx_netplay_is_resimulating() && !psx_selfcheck_resim_active()) {
+        WatchdogHostSectionScope timing(SW_HOST_AUDIO);
         sdl_audio_update(fmv_skip_active,
                          turbo_loads_active && g_turbo_audio_sink_enabled);
     }
@@ -9039,7 +9050,7 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
      * frame hooks may touch guest state, so neither may depend on whether this
      * frame is presented — otherwise headless validation runs a different game
      * than the windowed build. Hooks still run after all normal input sampling. */
-    mod_call_frame_hooks();
+    { WatchdogHostSectionScope timing(SW_HOST_MOD_HOOKS); mod_call_frame_hooks(); }
 
     /* Resize-driven mode updates the pending aspect during BIOS boot too, but
      * the actual wide compositor remains disengaged until game entry. No-op
@@ -9047,18 +9058,22 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
     update_adaptive_widescreen();
 
     /* Engage widescreen at game entry: BIOS boot stays authentic 4:3. */
-    if (!g_ws_engaged) {
-        if (fntrace_is_game_started()) {
-            g_ws_engaged = true;
-            g_ws_projection_mode = -1;
+    {
+        WatchdogHostSectionScope timing(SW_HOST_WIDESCREEN);
+        if (!g_ws_engaged) {
+            if (fntrace_is_game_started()) {
+                g_ws_engaged = true;
+                g_ws_projection_mode = -1;
+                refresh_widescreen_projection();
+            }
+        } else {
             refresh_widescreen_projection();
         }
-    } else {
-        refresh_widescreen_projection();
     }
 
     if (g_headless) {
 #ifndef PSX_NO_DEBUG_TOOLS
+        WatchdogHostSectionScope timing(SW_HOST_IMAGE_CAPTURE);
         headless_present_image_ring_capture();
 #endif
         ep.skip_pace = 1;

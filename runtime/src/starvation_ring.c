@@ -23,7 +23,7 @@
 #ifdef _WIN32
 #include <windows.h>
 static uint64_t host_us_now(void) {
-    LARGE_INTEGER f, c;
+    LARGE_INTEGER c;
     static LARGE_INTEGER freq = {0};
     if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&c);
@@ -44,6 +44,14 @@ extern uint32_t i_stat;
 extern uint32_t i_mask;
 extern int psx_get_in_exception(void);
 
+const char *starvation_watchdog_host_name(StarvationHostSection section) {
+    static const char *names[SW_HOST_SECTION_COUNT] = {
+        "debug_poll", "frame_record", "autocapture", "provider_poll", "audio",
+        "mod_hooks", "widescreen", "image_capture"
+    };
+    return (unsigned)section < SW_HOST_SECTION_COUNT ? names[section] : "unknown";
+}
+
 #if STARVATION_RING_ENABLED
 
 static PSX_BSS StarvationEntry s_ring[STARVATION_RING_CAP];
@@ -53,6 +61,74 @@ static uint64_t        s_seq = 0;
  * cross-thread store/load is single-copy atomic on every target. */
 static _Atomic uint64_t s_last_heartbeat_us = 0;
 static int             s_dump_done = 0;
+static StarvationWatchdogGap s_max_gap;
+static uint64_t s_previous_check_us, s_previous_cpu_us, s_previous_guest_cycles;
+static uint32_t s_previous_func;
+static int s_previous_cpu_valid;
+static StarvationHostTiming s_host_timing[SW_HOST_SECTION_COUNT];
+
+uint64_t starvation_watchdog_host_begin(void) { return host_us_now(); }
+void starvation_watchdog_host_end(StarvationHostSection section, uint64_t begin) {
+    if ((unsigned)section >= SW_HOST_SECTION_COUNT || !begin) return;
+    uint64_t end = host_us_now();
+    uint64_t elapsed = end >= begin ? end - begin : 0;
+    StarvationHostTiming *s = &s_host_timing[section];
+    s->calls++;
+    s->total_us += elapsed;
+    if (elapsed > s->max_us) s->max_us = elapsed;
+}
+void starvation_watchdog_host_timing(StarvationHostSection section, StarvationHostTiming *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if ((unsigned)section < SW_HOST_SECTION_COUNT) *out = s_host_timing[section];
+}
+
+static int thread_cpu_us_now(uint64_t *out) {
+#ifdef _WIN32
+    FILETIME created, exited, kernel, user;
+    if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user))
+        return 0;
+    ULARGE_INTEGER k, u;
+    k.LowPart = kernel.dwLowDateTime; k.HighPart = kernel.dwHighDateTime;
+    u.LowPart = user.dwLowDateTime; u.HighPart = user.dwHighDateTime;
+    *out = (k.QuadPart + u.QuadPart) / 10u;
+    return 1;
+#elif defined(CLOCK_THREAD_CPUTIME_ID)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
+    *out = (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+    return 1;
+#else
+    (void)out;
+    return 0;
+#endif
+}
+
+static void record_check_gap(uint64_t now) {
+    uint64_t cpu = 0, guest = psx_get_cycle_count();
+    int valid = thread_cpu_us_now(&cpu);
+    if (s_previous_check_us && now > s_previous_check_us &&
+        now - s_previous_check_us > s_max_gap.wall_us) {
+        s_max_gap.wall_us = now - s_previous_check_us;
+        s_max_gap.cpu_time_available = valid && s_previous_cpu_valid &&
+                                      cpu >= s_previous_cpu_us;
+        s_max_gap.cpu_us = s_max_gap.cpu_time_available ? cpu - s_previous_cpu_us : 0;
+        /* A state restore can rewind guest time; never wrap that subtraction. */
+        s_max_gap.guest_cycles = guest >= s_previous_guest_cycles ?
+                                guest - s_previous_guest_cycles : 0;
+        s_max_gap.func_before = s_previous_func;
+        s_max_gap.func_after = g_debug_current_func_addr;
+    }
+    s_previous_check_us = now;
+    s_previous_cpu_us = cpu;
+    s_previous_guest_cycles = guest;
+    s_previous_cpu_valid = valid;
+    s_previous_func = g_debug_current_func_addr;
+}
+
+void starvation_watchdog_get_max_gap(StarvationWatchdogGap *out) {
+    if (out) *out = s_max_gap;
+}
 
 static uint64_t heartbeat_load(void) {
     return atomic_load_explicit(&s_last_heartbeat_us, memory_order_relaxed);
@@ -88,6 +164,11 @@ void starvation_ring_reset(void) {
     s_seq = 0;
     atomic_store_explicit(&s_last_heartbeat_us, 0, memory_order_relaxed);
     s_dump_done = 0;
+    memset(&s_max_gap, 0, sizeof(s_max_gap));
+    s_previous_check_us = s_previous_cpu_us = s_previous_guest_cycles = 0;
+    s_previous_func = 0;
+    s_previous_cpu_valid = 0;
+    memset(s_host_timing, 0, sizeof(s_host_timing));
 }
 
 void starvation_ring_record(uint8_t kind, uint8_t tx, uint8_t rx,
@@ -212,7 +293,11 @@ void starvation_ring_dump(const char *path) {
                 "\"psx_cycle_count\":%llu,"
                 "\"current_func\":\"0x%08X\",\"last_store_pc\":\"0x%08X\","
                 "\"in_exception\":%u,\"i_stat\":\"0x%08X\",\"i_mask\":\"0x%08X\","
-                "\"net_arch\":\"%s\",\"max_players\":%d,\"player_count\":%d}}\n",
+                "\"net_arch\":\"%s\",\"max_players\":%d,\"player_count\":%d,"
+                "\"check_gap_wall_us\":%llu,\"check_gap_cpu_us\":%llu,"
+                "\"check_gap_guest_cycles\":%llu,\"check_gap_cpu_available\":%d,"
+                "\"check_gap_func_before\":\"0x%08X\","
+                "\"check_gap_func_after\":\"0x%08X\"}}\n",
                 (unsigned long long)total, (unsigned long long)avail,
                 (unsigned long long)heartbeat_load(),
                 (unsigned long long)host_us_now(),
@@ -220,7 +305,12 @@ void starvation_ring_dump(const char *path) {
                 g_debug_current_func_addr, g_debug_last_store_pc,
                 (unsigned)psx_get_in_exception(),
                 i_stat, i_mask,
-                net_arch, max_players, player_count);
+                net_arch, max_players, player_count,
+                (unsigned long long)s_max_gap.wall_us,
+                (unsigned long long)s_max_gap.cpu_us,
+                (unsigned long long)s_max_gap.guest_cycles,
+                s_max_gap.cpu_time_available, s_max_gap.func_before,
+                s_max_gap.func_after);
     }
     uint64_t start = total > avail ? total - avail : 0;
     for (uint64_t i = start; i < total; i++) {
@@ -265,6 +355,9 @@ void starvation_watchdog_check(void) {
     uint64_t timeout = starvation_timeout_us();
     if (timeout == 0) return;              /* watchdog disabled (renderer bring-up) */
     uint64_t now = host_us_now();
+    record_check_gap(now);
+    /* Keep the final refresh check after passive OS accounting as well: a
+     * diagnostic system call must not widen the stale-evidence window. */
     uint64_t confirmed_last = heartbeat_load();
     if (starvation_watchdog_confirmed_stale(last, now, confirmed_last, timeout)) {
         starvation_ring_dump(NULL);
@@ -300,6 +393,17 @@ void starvation_ring_record(uint8_t kind, uint8_t tx, uint8_t rx,
 }
 void starvation_watchdog_heartbeat(void) {}
 void starvation_watchdog_check(void) {}
+uint64_t starvation_watchdog_host_begin(void) { return 0; }
+void starvation_watchdog_host_end(StarvationHostSection section, uint64_t begin) {
+    (void)section; (void)begin;
+}
+void starvation_watchdog_host_timing(StarvationHostSection section, StarvationHostTiming *out) {
+    (void)section;
+    if (out) memset(out, 0, sizeof(*out));
+}
+void starvation_watchdog_get_max_gap(StarvationWatchdogGap *out) {
+    if (out) memset(out, 0, sizeof(*out));
+}
 void starvation_ring_dump(const char *path) { (void)path; }
 void starvation_ring_reset(void) {}
 void starvation_ring_pc_sample(void) {}

@@ -99,6 +99,38 @@ void starvation_watchdog_heartbeat(void);
 /* Run watchdog check from a hot path (e.g. psx_advance_cycles). */
 void starvation_watchdog_check(void);
 
+/* Passive observations between checks on the emulation thread. CPU time is
+ * kernel+user time (not wall time); no thread is suspended. These diagnose
+ * scheduling/blocking gaps without changing the watchdog decision. */
+typedef struct {
+    uint64_t wall_us;
+    uint64_t cpu_us;
+    uint64_t guest_cycles;
+    uint32_t func_before;
+    uint32_t func_after;
+    int cpu_time_available;
+} StarvationWatchdogGap;
+void starvation_watchdog_get_max_gap(StarvationWatchdogGap *out);
+
+typedef enum {
+    SW_HOST_DEBUG_POLL,
+    SW_HOST_FRAME_RECORD,
+    SW_HOST_AUTOCAPTURE,
+    SW_HOST_PROVIDER_POLL,
+    SW_HOST_AUDIO,
+    SW_HOST_MOD_HOOKS,
+    SW_HOST_WIDESCREEN,
+    SW_HOST_IMAGE_CAPTURE,
+    SW_HOST_SECTION_COUNT
+} StarvationHostSection;
+typedef struct {
+    uint64_t calls, total_us, max_us;
+} StarvationHostTiming;
+uint64_t starvation_watchdog_host_begin(void);
+void starvation_watchdog_host_end(StarvationHostSection section, uint64_t begin);
+const char *starvation_watchdog_host_name(StarvationHostSection section);
+void starvation_watchdog_host_timing(StarvationHostSection section, StarvationHostTiming *out);
+
 /* Pure staleness decision behind starvation_watchdog_check(), exposed so a
  * unit test can pin it without linking the ring.
  *

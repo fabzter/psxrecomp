@@ -354,6 +354,9 @@ static void publish_parse_locked(const char *buf, int n) {
  * compiler. There is exactly one mapped handoff at a time. The worker also
  * waits for the preceding main-thread commit to finish before entering the
  * process-wide Windows loader lock again. */
+#ifdef PSX_AUTOCOMPILE_TEST
+static HANDLE s_test_done_seen, s_test_done_release;
+#endif
 static DWORD WINAPI publish_prepare_thread_main(LPVOID unused) {
     (void)unused;
     for (;;) {
@@ -454,6 +457,12 @@ static DWORD WINAPI publish_prepare_thread_main(LPVOID unused) {
     }
     if (!s_publish_stop)
         ac_state_store(AC_DONE);
+#ifdef PSX_AUTOCOMPILE_TEST
+    if (s_test_done_seen && s_test_done_release) {
+        SetEvent(s_test_done_seen);
+        WaitForSingleObject(s_test_done_release, INFINITE);
+    }
+#endif
     return 0;
 }
 
@@ -544,6 +553,15 @@ static void out_append(const char *buf, int n) {
 }
 
 #ifdef PSX_AUTOCOMPILE_TEST
+void autocompile_test_hold_done(HANDLE seen, HANDLE release) {
+    s_test_done_seen = seen;
+    s_test_done_release = release;
+}
+int autocompile_test_set_watch_thread(HANDLE thread) {
+    if (s_watch_thread) return 0;
+    s_watch_thread = thread;
+    return 1;
+}
 void autocompile_test_feed_output(const char *buf, int n) {
     out_append(buf, n);
 }
@@ -1398,14 +1416,19 @@ void autocompile_poll_main(void) {
     if (publish_pending()) return;
     /* DONE is published immediately before the preparer returns. Join both
      * per-run workers before exposing IDLE, so a new run cannot inherit a live
-     * consumer of the shared FIFO. Neither worker needs the emulation thread. */
+     * consumer of the shared FIFO. DONE is NOT a signaled thread handle:
+     * the worker can be descheduled at that boundary. Never wait for it from
+     * the emulation/VBlank poll; retry next frame while preserving DONE and
+     * every handle. Shutdown remains the owner of blocking worker joins. */
+    if (s_prepare_thread &&
+        WaitForSingleObject(s_prepare_thread, 0) != WAIT_OBJECT_0) return;
+    if (s_watch_thread &&
+        WaitForSingleObject(s_watch_thread, 0) != WAIT_OBJECT_0) return;
     if (s_prepare_thread) {
-        WaitForSingleObject(s_prepare_thread, INFINITE);
         CloseHandle(s_prepare_thread);
         s_prepare_thread = NULL;
     }
     if (s_watch_thread) {
-        WaitForSingleObject(s_watch_thread, INFINITE);
         CloseHandle(s_watch_thread);
         s_watch_thread = NULL;
     }
