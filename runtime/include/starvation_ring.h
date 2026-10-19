@@ -112,10 +112,23 @@ void starvation_watchdog_check(void);
  * negative gap by construction. Returns 1 when the watchdog should fire.
  * `timeout == 0` disables it; `last == 0` means "no heartbeat yet". */
 static inline int starvation_watchdog_stale(uint64_t last, uint64_t now,
-                                            uint64_t timeout) {
+                                             uint64_t timeout) {
     if (last == 0 || timeout == 0) return 0;
     if (now <= last) return 0;
     return (now - last) > timeout;
+}
+
+/* Read heartbeat_before, sample now, then read heartbeat_after. A host
+ * suspension between the first read and the clock sample may leave the first
+ * value stale even though another thread refreshed the heartbeat. Require
+ * both observations to be stale; a changed but still expired stamp must not
+ * hide a real stall. A post-clock/future stamp is fresh for this check. */
+static inline int starvation_watchdog_confirmed_stale(uint64_t heartbeat_before,
+                                                       uint64_t now,
+                                                       uint64_t heartbeat_after,
+                                                       uint64_t timeout) {
+    return starvation_watchdog_stale(heartbeat_before, now, timeout) &&
+           starvation_watchdog_stale(heartbeat_after, now, timeout);
 }
 
 /* Manual dump-to-file (for testing / TCP probe). Filename can be NULL. */

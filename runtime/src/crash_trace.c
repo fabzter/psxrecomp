@@ -41,6 +41,8 @@
 #include "psx_memory.h"
 #include "psx_bss.h"
 #include "crash_trace.h"
+#include "host_sampler.h"
+#include "overlay_loader.h"
 #include "psx_segment_miss.h"
 #include "autocompile.h"   /* autocompile_degraded_reason — stamp a degraded
                             * (interpreter-only) run into its own report */
@@ -436,6 +438,28 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
         g_dirty_ram_last_unsupported_entry_ra,
         g_dirty_ram_last_unsupported_entry_sp,
         g_dirty_ram_last_unsupported_insns);
+
+    uint64_t load_total_us = 0, load_max_us = 0, load_last_us = 0;
+    overlay_loader_get_load_timing(&load_total_us, &load_max_us, &load_last_us);
+    append_fmt(buf, sizeof(buf), &pos,
+        "  \"overlay_load_total_us\": %llu,\n"
+        "  \"overlay_load_max_us\": %llu,\n"
+        "  \"overlay_load_last_us\": %llu,\n",
+        (unsigned long long)load_total_us,
+        (unsigned long long)load_max_us,
+        (unsigned long long)load_last_us);
+
+    append_fmt(buf, sizeof(buf), &pos,
+        "  \"host_sampler_max_suspend_us\": %llu,\n"
+        "  \"host_sampler_max_suspend_wait_us\": %llu,\n"
+        "  \"host_sampler_max_suspend_hold_us\": %llu,\n"
+        "  \"host_sampler_worst_hold_target_cpu_us\": %llu,\n"
+        "  \"host_sampler_suspend_age_us\": %llu,\n",
+        (unsigned long long)host_sampler_max_suspend_us(),
+        (unsigned long long)host_sampler_max_suspend_wait_us(),
+        (unsigned long long)host_sampler_max_suspend_hold_us(),
+        (unsigned long long)host_sampler_worst_hold_target_cpu_us(),
+        (unsigned long long)host_sampler_suspend_age_us());
 
 #ifdef _WIN32
     if (seh_info) {

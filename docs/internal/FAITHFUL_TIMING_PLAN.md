@@ -213,6 +213,69 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-10-19 — DBFB release validation: scope and reopened host stall.**
+  Windows suspension sampling now requires the exact opt-in
+  `PSX_HOST_SAMPLER_SUSPEND=1`; default/invalid/enabled policy tests pass.
+  This removes the known external-suspension mechanism, not every possible
+  host stall. Extracted-package original-mode runs later hit the unchanged
+  starvation watchdog twice (frames 9781/17850), with sampler suspension=0.
+  The second had working autocompile. A warm diagnostic run completed two
+  combats/300 s and exited normally; another cold run exited normally but
+  did not complete a KO. These do not establish a fix for the new failure.
+  Existing overlay loader total/max/last wall-time counters are now serialized
+  into the final structured report for attribution (no logs or guest changes).
+  Warm run max load 2204 us; cold non-crashing run 44191 us. Do not attribute
+  the earlier >4 s stalls to the DLL loader without a failing measurement.
+  Title v0.2.0 is experimental; R0's broader intermittent failure is reopened.
+  Watchdog thresholds and guest timing are unchanged by this continuation.
+
+- **2026-10-18 — Host sampler suspension split (R0 attribution).**
+  The always-on Windows host sampler (`host_sampler.c`) suspends the emulation
+  thread every 1 ms. `host_sampler_max_suspend_us` is now split into
+  `max_suspend_wait_us` (time blocked in `SuspendThread`) and
+  `max_suspend_hold_us` (target actually suspended), plus
+  `host_sampler_worst_hold_target_cpu_us` (`GetThreadTimes` kernel+user time
+  consumed during the worst hold) and `host_sampler_suspend_age_us` (live
+  hold). These are published in `psx_last_run_report.json`,
+  `psx_freeze_heartbeat.json` and the `host_profile` command. Pure age helper
+  `host_suspend_age_us_from` is inline for deterministic tests. No guest MIPS,
+  IRQ, cycle or watchdog-decision change; the starvation threshold and logic
+  are untouched.
+  Measured on the session-l reproduction (420 s, `--savestate --movement`,
+  private folders `-q`..`-aa`): worst holds per run 81,767 / 119,588 / 130,002 /
+  132,670 / 136,568 / 141,250 / 161,388 / 173,844 / 207,902 / 394,562 /
+  1,783,293 / 1,944,235 µs. `wait` stayed 207–425 µs; on every hold where the
+  CPU discriminator ran (82–208 ms) the target consumed **0 µs** CPU — it was
+  suspended, not inside a kernel operation. During a hold the guest cycle,
+  frame and dirty-insn counters are frozen (session l's heartbeat ring: 63
+  identical-cycle ticks, then +47,458 cycles just before the abort).
+  The heartbeat is stamped by the emulation thread and the watchdog check runs
+  on it, so a hold cannot be detected until the thread resumes; a hold longer
+  than the 4 s timeout then aborts on the first check (l: 12.414350 s). This
+  establishes the *mechanism* as a host suspension, not a MIPS loop, but a
+  ≥4 s hold was not recaptured (max 1.944 s), so R0 remains **open**.
+  Next: repeat 420 s runs until `max_suspend_hold_us >= 4000000` and exit 2
+  reproduce l with the cause attached; then stop suspending the emulation
+  thread from the sampler (opt-in suspend sampler or cooperative in-thread
+  sampling) and repeat the same reproduction. No closure claim.
+
+- **2026-10-18 — Watchdog heartbeat revalidation (host-only race).**
+  `starvation_watchdog_check` now reads heartbeat / host clock / heartbeat and
+  uses the pure `starvation_watchdog_confirmed_stale` helper: both observed
+  stamps must be expired at the sampled time before aborting. A refresh during
+  suspension of the checking thread, including a stamp newer than the clock,
+  invalidates the first stale observation. Unchanged expired stamps and changed
+  but still expired stamps retain real-stall detection; timeout and disable/reset
+  semantics are unchanged. No guest MIPS, IRQ or cycle-accounting changes.
+  The standalone GCC C11 test passed all 26 checks (15 new deterministic
+  interleaving/boundary checks) with `-Wall -Wextra -Werror -pedantic`; binary:
+  `%TEMP%/opencode/dbfb-watchdog-two-read-20261018.exe`. The first compile attempt
+  failed without diagnostics until the existing MSYS2 bin directory was added
+  to the command's PATH; the subsequent compile and execution exited 0.
+  No game run or full runtime build was performed. This closes the synthetic
+  stale-first-read race, not the attribution of DBFB session c's 10.6 s pause.
+  A refresh after the final load is outside this bounded observation window.
+
 - **2026-10-07 — DuckStation texture authoring fidelity (beads-qi66).**
   The early Tomba capture report exposed per-draw crops and automatic page
   fallback in the opt-in HD texture enhancement. An independent synthetic
@@ -1987,3 +2050,15 @@ Guest-frame lookup merged multiple extra presentations and could not verify
 HUD stability. Added duplicate-frame/freeze/eviction regression coverage and
 retained legacy frame lookup. Six focused framework checks and all 21 title
 checks pass on Windows and Linux, and both runtime builds link successfully.
+
+### 2026-10-18: Final Bout Windows sampler stall observability
+
+No timing/emulation or watchdog threshold change. The Windows host sampler now
+measures its SuspendThread/GetThreadContext interval and publishes its maximum
+before resuming the target. `host_profile.max_suspend_us` and the final report's
+`host_sampler_max_suspend_us` retain the measurement if the target immediately
+exits. QPC conversion avoids multiplying the full counter by a million.
+Normal/PGXP builds pass. Two 420-second title sessions each completed four
+combats, pause, state save/load and exit0; max interval123400/173844us.
+Neither reproduced the prior12.4s watchdog failure; its cause is still unknown.
+This is diagnostic evidence, not a core-correctness or stability claim.

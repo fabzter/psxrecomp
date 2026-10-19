@@ -257,20 +257,23 @@ void starvation_watchdog_check(void) {
     /* Load the heartbeat BEFORE sampling the clock. The IO thread stamps it
      * concurrently; with the reads in the other order a stamp landing in
      * between made now < last and the unsigned gap wrapped past any
-     * threshold (see starvation_watchdog_stale). */
+     * threshold (see starvation_watchdog_stale). Re-read AFTER the clock so
+     * a concurrent refresh during a host suspension invalidates stale evidence
+     * from the first load. */
     uint64_t last = heartbeat_load();
     if (last == 0) return;                 /* not initialized yet */
     uint64_t timeout = starvation_timeout_us();
     if (timeout == 0) return;              /* watchdog disabled (renderer bring-up) */
     uint64_t now = host_us_now();
-    if (starvation_watchdog_stale(last, now, timeout)) {
+    uint64_t confirmed_last = heartbeat_load();
+    if (starvation_watchdog_confirmed_stale(last, now, confirmed_last, timeout)) {
         starvation_ring_dump(NULL);
         /* Abort cleanly so the dump file is preserved and the user knows
          * the runtime starved. Tag the exit so psx_last_run_report.json
          * says "starvation_watchdog" instead of atexit/unknown. */
         fprintf(stderr, "starvation_watchdog: %llu us without heartbeat — "
                 "ring dumped to starvation_dump.jsonl, aborting\n",
-                (unsigned long long)(now - last));
+                (unsigned long long)(now - confirmed_last));
         fflush(stderr);
         psx_crash_trace_set_exit_origin("starvation_watchdog");
         exit(2);

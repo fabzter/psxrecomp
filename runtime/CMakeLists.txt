@@ -23,6 +23,15 @@ psxrecomp_add_runtime_target(psx-runtime
 # (docs/ENHANCEMENTS.md G1.10). Titles get their <exe>_pgxp the same way.
 
 if(BUILD_TESTING)
+    if(WIN32)
+        add_executable(host_sampler_policy_test tests/test_host_sampler_policy.c src/host_sampler.c)
+        target_include_directories(host_sampler_policy_test PRIVATE include)
+        set_property(TARGET host_sampler_policy_test PROPERTY C_STANDARD 11)
+        foreach(mode default invalid enabled)
+            add_test(NAME host_sampler_policy_${mode} COMMAND host_sampler_policy_test ${mode})
+            set_tests_properties(host_sampler_policy_${mode} PROPERTIES TIMEOUT 10)
+        endforeach()
+    endif()
     add_executable(debug_socket_shutdown_test tests/test_debug_socket_shutdown.cpp)
     target_include_directories(debug_socket_shutdown_test PRIVATE src)
     find_package(Threads REQUIRED)

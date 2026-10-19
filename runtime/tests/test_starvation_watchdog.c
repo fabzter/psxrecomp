@@ -9,7 +9,8 @@
  * `last > now`; `now - last` wrapped to ~1.8e19 us, beat the 4 s threshold,
  * and a healthy 60 fps runtime exited with a dump whose meta line showed the
  * heartbeat was 402 us old. starvation_watchdog_stale() refuses a negative gap
- * by construction; this test pins that property.
+ * by construction; this test pins that property. The two-read helper also
+ * pins deterministic interleavings around a suspension of the checking thread.
  *
  * Build: gcc -I../include -o test_starvation_watchdog test_starvation_watchdog.c
  */
@@ -60,6 +61,40 @@ int main(void) {
           "max heartbeat vs tiny clock does not fire");
     CHECK(starvation_watchdog_stale(1, UINT64_MAX, TIMEOUT) == 1,
           "tiny heartbeat vs max clock fires");
+
+    /* 6. Deterministic read / clock / read interleavings, without sleeps or
+     * threads. At N the original stamp T really is expired. */
+    const uint64_t N = T + 3 * TIMEOUT;
+    CHECK(starvation_watchdog_confirmed_stale(N - 402, N, N - 402, TIMEOUT) == 0,
+          "heartbeat refreshed before the first read stays fresh");
+    CHECK(starvation_watchdog_stale(T, N, TIMEOUT) == 1,
+          "pre-suspension first read alone would fire");
+    CHECK(starvation_watchdog_confirmed_stale(T, N, N - 402, TIMEOUT) == 0,
+          "refresh during suspension before the clock prevents false abort");
+    CHECK(starvation_watchdog_confirmed_stale(T, N, N, TIMEOUT) == 0,
+          "refresh equal to the clock prevents abort");
+    CHECK(starvation_watchdog_confirmed_stale(T, N, N + 1, TIMEOUT) == 0,
+          "refresh after the clock (future stamp) prevents abort");
+    CHECK(starvation_watchdog_confirmed_stale(N + 1, N, N + 1, TIMEOUT) == 0,
+          "future first stamp cannot wrap the confirmed gap");
+    CHECK(starvation_watchdog_confirmed_stale(T, N, T, TIMEOUT) == 1,
+          "unchanged expired heartbeat still detects a real stall");
+    CHECK(starvation_watchdog_confirmed_stale(T, N, T + 1, TIMEOUT) == 1,
+          "changed but still expired heartbeat still fires");
+    CHECK(starvation_watchdog_confirmed_stale(T, N, N - TIMEOUT, TIMEOUT) == 0,
+          "confirmed age exactly at the unchanged threshold does not fire");
+    CHECK(starvation_watchdog_confirmed_stale(T, N, N - TIMEOUT - 1, TIMEOUT) == 1,
+          "confirmed age one past the unchanged threshold fires");
+    CHECK(starvation_watchdog_confirmed_stale(T, N, T, 0) == 0,
+          "zero timeout disables the two-read decision");
+    CHECK(starvation_watchdog_confirmed_stale(0, N, T, TIMEOUT) == 0,
+          "uninitialized first heartbeat does not fire");
+    CHECK(starvation_watchdog_confirmed_stale(T, N, 0, TIMEOUT) == 0,
+          "heartbeat reset before confirmation does not fire");
+    CHECK(starvation_watchdog_confirmed_stale(UINT64_MAX, 1, UINT64_MAX, TIMEOUT) == 0,
+          "two-read decision rejects negative gaps at integer extremes");
+    CHECK(starvation_watchdog_confirmed_stale(1, UINT64_MAX, 1, TIMEOUT) == 1,
+          "two-read decision preserves real stalls at integer extremes");
 
     if (failures) { printf("%d failure(s)\n", failures); return 1; }
     printf("all starvation watchdog checks passed\n");

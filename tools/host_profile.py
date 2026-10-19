@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Name the hot host functions of a running psxrecomp game.
 
-Reads the always-on host CPU sampler (TCP host_profile, runtime/src/
+Reads the host CPU sampler (TCP host_profile, runtime/src/
 host_sampler.c) over a window of the ring and maps each executable-relative
 address to the function containing it, using the image's own symbol table
 (nm), so a Release build without debug info profiles too.
@@ -10,6 +10,10 @@ address to the function containing it, using the image's own symbol table
 
 --frames N: the last N guest frames. --pass 1 / 0: only samples inside /
 outside render passes. Prints per-function sample counts and shares.
+
+On Windows, start the target with PSX_HOST_SAMPLER_SUSPEND=1 explicitly.
+This intrusive diagnostic can delay the emulation thread; it is disabled
+for normal gameplay. Prefer an external system profiler for passive captures.
 """
 import argparse
 import bisect

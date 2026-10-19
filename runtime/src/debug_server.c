@@ -5477,15 +5477,23 @@ static void handle_host_profile(int id, const char *json)
         }
         counts[b]++;
     }
-    size_t cap = 256 + (size_t)top * 48;
+    size_t cap = 320 + (size_t)top * 48;
     char *buf = (char *)malloc(cap);
     if (!buf) { send_err(id, "oom"); return; }
     size_t n = (size_t)snprintf(buf, cap,
         "{\"id\":%d,\"ok\":true,\"supported\":%d,\"seq\":%llu,"
-        "\"image_base\":\"0x%llX\",\"samples\":%llu,\"unbinned\":%llu,\"top\":[",
+        "\"image_base\":\"0x%llX\",\"samples\":%llu,\"unbinned\":%llu,"
+        "\"max_suspend_us\":%llu,\"max_suspend_wait_us\":%llu,"
+        "\"max_suspend_hold_us\":%llu,\"worst_hold_target_cpu_us\":%llu,"
+        "\"suspend_age_us\":%llu,\"top\":[",
         id, host_sampler_supported(), (unsigned long long)seq,
         (unsigned long long)host_sampler_image_base(),
-        (unsigned long long)total, (unsigned long long)dropped);
+        (unsigned long long)total, (unsigned long long)dropped,
+        (unsigned long long)host_sampler_max_suspend_us(),
+        (unsigned long long)host_sampler_max_suspend_wait_us(),
+        (unsigned long long)host_sampler_max_suspend_hold_us(),
+        (unsigned long long)host_sampler_worst_hold_target_cpu_us(),
+        (unsigned long long)host_sampler_suspend_age_us());
     for (int k = 0; k < top; k++) {
         int best = -1;
         for (int b = 0; b < nb; b++)

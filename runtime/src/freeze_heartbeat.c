@@ -8,6 +8,7 @@
 #include "crash_trace.h"   /* g_psx_fatal_reason */
 #include "cpu_state.h"     /* g_psx_bail_* call-contract counters */
 #include "starvation_ring.h"
+#include "host_sampler.h"  /* host-suspension attribution for a frozen ring */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -920,6 +921,11 @@ static void heartbeat_write(void) {
         "  \"wall_clock_epoch\":%lld,\n"
         "  \"frame_count\":%llu,\n"
         "  \"psx_cycle_count\":%llu,\n"
+        "  \"host_sampler_max_suspend_us\":%llu,\n"
+        "  \"host_sampler_max_suspend_wait_us\":%llu,\n"
+        "  \"host_sampler_max_suspend_hold_us\":%llu,\n"
+        "  \"host_sampler_worst_hold_target_cpu_us\":%llu,\n"
+        "  \"host_suspend_age_us\":%llu,\n"
         "  \"current_func\":\"0x%08X\",\n"
         "  \"last_store_pc\":\"0x%08X\",\n"
         "  \"total_checks\":%llu,\n"
@@ -985,6 +991,11 @@ static void heartbeat_write(void) {
         wall,
         (unsigned long long)frame,
         (unsigned long long)cyc,
+        (unsigned long long)host_sampler_max_suspend_us(),
+        (unsigned long long)host_sampler_max_suspend_wait_us(),
+        (unsigned long long)host_sampler_max_suspend_hold_us(),
+        (unsigned long long)host_sampler_worst_hold_target_cpu_us(),
+        (unsigned long long)host_sampler_suspend_age_us(),
         cur_fn,
         last_store,
         (unsigned long long)total_checks,
