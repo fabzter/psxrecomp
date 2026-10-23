@@ -2991,10 +2991,26 @@ static int toolchain_bin_compiler_works(const char* bin) {
             return 0;
     }
 #else
-    if (!join_path(clang, sizeof(clang), bin, "clang") || !path_is_file(clang))
+    /* cmake-clang-v1 macos-universal packs are kind "cmake-ninja-system-clang":
+     * bin/ ships cmake+ninja+ccache only and the pack's own env.sh builds with
+     * the Xcode CLT clang (/usr/bin/clang). Demanding bin/clang+ld.lld here
+     * (the Linux pack layout) quarantines a healthy macOS pack as .broken and
+     * makes the wizard re-download it in a loop. When the pack ships no
+     * clang, validate the SYSTEM clang for the smoke test instead. */
+    int use_system_clang = 0;
+    if (!join_path(clang, sizeof(clang), bin, "clang") || !path_is_file(clang)) {
+        int have_lld = join_path(lld, sizeof(lld), bin, "ld.lld") &&
+                       path_is_file(lld);
+        if (have_lld)
+            return 0; /* clang absent + lld present is an incomplete pack */
+        use_system_clang = 1;
+        snprintf(clang, sizeof(clang), "/usr/bin/clang");
+        if (!path_is_file(clang))
+            return 0;
+    } else if (!join_path(lld, sizeof(lld), bin, "ld.lld") ||
+               !path_is_file(lld)) {
         return 0;
-    if (!join_path(lld, sizeof(lld), bin, "ld.lld") || !path_is_file(lld))
-        return 0;
+    }
 #endif
     if (!cmake_path_runs(clang))
         return 0;
@@ -3028,12 +3044,14 @@ static int toolchain_bin_compiler_works(const char* bin) {
              ">NUL 2>&1\"",
              bin, clang, src, exe);
 #else
-    /* Prefer the pack linker explicitly so PATH cannot hide a broken lld. */
+    /* Prefer the pack linker explicitly so PATH cannot hide a broken lld.
+     * use_system_clang (macos cmake-ninja-system-clang packs): build with the
+     * system Xcode CLT clang and its default linker — those packs ship no lld. */
     (void)lld; /* used via -fuse-ld when present; path already validated */
     snprintf(cmd, sizeof(cmd),
-             "env PATH=\"%s:$PATH\" \"%s\" -fuse-ld=lld \"%s\" -o \"%s\" "
+             "env PATH=\"%s:$PATH\" \"%s\" %s \"%s\" -o \"%s\" "
              ">/dev/null 2>&1",
-             bin, clang, src, exe);
+             bin, clang, use_system_clang ? "" : "-fuse-ld=lld", src, exe);
 #endif
     ok = run_cmd_exit_zero(cmd);
 #if defined(_WIN32)
