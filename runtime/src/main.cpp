@@ -2164,6 +2164,13 @@ static std::filesystem::path find_upward(std::filesystem::path start,
     return {};
 }
 
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>   /* _NSGetExecutablePath: authoritative on macOS */
+#elif defined(__linux__)
+#include <limits.h>
+#include <unistd.h>        /* readlink("/proc/self/exe") */
+#endif
+
 // The directory the running executable lives in — the SINGLE anchor for every
 // runtime file (game.toml, disc, BIOS, settings.toml, caches, memcards, sidecar
 // .cfg). Deliberately NEVER the current working directory: a game must launch
@@ -2183,6 +2190,34 @@ static std::filesystem::path exe_dir_from_argv(const char* argv0) {
         DWORD n = GetModuleFileNameW(NULL, buf, (DWORD)(sizeof(buf) / sizeof(buf[0])));
         if (n > 0 && n < (DWORD)(sizeof(buf) / sizeof(buf[0]))) {
             exe_dir = fs::path(std::wstring(buf, buf + n)).parent_path();
+        }
+    }
+#endif
+#if defined(__APPLE__)
+    // LaunchServices (Finder, Spotlight, `open`) hands us a bare or relative
+    // argv[0] and a working directory of "/", so fs::absolute(argv[0]) anchored
+    // every runtime file at the filesystem root: assets/ (pad art, fonts) and
+    // the game config were never found, and the launcher silently fell back to
+    // default fonts and no icons. _NSGetExecutablePath is the authoritative
+    // source, exactly as GetModuleFileNameW is on Windows.
+    if (exe_dir.empty()) {
+        char raw[PATH_MAX * 4];
+        uint32_t size = (uint32_t)sizeof(raw);
+        if (_NSGetExecutablePath(raw, &size) == 0) {
+            fs::path p = fs::weakly_canonical(fs::path(raw), ec);
+            if (ec) { p = fs::path(raw); ec.clear(); }
+            exe_dir = p.parent_path();
+        }
+    }
+#elif defined(__linux__)
+    // Same class of launch: a desktop entry or PATH lookup can leave argv[0]
+    // bare. /proc/self/exe is the equivalent authoritative answer.
+    if (exe_dir.empty()) {
+        char resolved[PATH_MAX];
+        const ssize_t n = ::readlink("/proc/self/exe", resolved, sizeof(resolved) - 1);
+        if (n > 0) {
+            resolved[n] = '\0';
+            exe_dir = fs::path(resolved).parent_path();
         }
     }
 #endif
