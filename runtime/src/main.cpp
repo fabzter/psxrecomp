@@ -4543,6 +4543,14 @@ static void refresh_player_devices(void) {
         sio_set_pad_config_capable(
             s, policy.callback ? policy.config_capable
                                : mode != PSXRecompV4::PAD_MODE_DIGITAL);
+        /* Say out loud which pad the seat presents. A digital seat is an
+         * SCPH-1080 with no config handshake, so a title's rumble option cannot
+         * do anything -- worth stating at boot instead of guessing later. */
+        std::fprintf(stdout,
+            "psxrecomp runtime: slot %d pad = %s (rumble %s)\n", s + 1,
+            mode != PSXRecompV4::PAD_MODE_DIGITAL ? "analog/DualShock"
+                                                  : "digital/SCPH-1080",
+            mode != PSXRecompV4::PAD_MODE_DIGITAL ? "capable" : "unavailable");
     }
 }
 
