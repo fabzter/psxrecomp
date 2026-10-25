@@ -365,6 +365,22 @@ static SDL_Texture*  sdl_texture;
 /* Per-player input device routing (PSX ports 1 & 2). Seeded from the
  * [controller] settings the launcher writes; the runtime opens the matching
  * SDL controller (or uses the keyboard) and feeds each PSX pad slot. */
+/* Optional title-provided rumble backend (weak symbols: a title opts in by
+ * defining them; the framework links and works without).
+ *
+ * Motivating case: DS4-family pads over Bluetooth accept SDL's HIDAPI effects
+ * write (IOReturn 0) and ignore it, because hidapi passes the Bluetooth report
+ * id separately from the payload. A title that knows the platform-specific
+ * convention can supply psx_host_rumble_* and take over for those pads. */
+#if defined(__APPLE__) && defined(PSX_SDL3)
+extern "C" {
+__attribute__((weak)) int  psx_host_rumble_attach(uint16_t vid, uint16_t pid);
+__attribute__((weak)) void psx_host_rumble_update(uint8_t small, uint8_t large);
+__attribute__((weak)) void psx_host_rumble_detach(void);
+}
+#define PSX_HAS_TITLE_RUMBLE_HOOK 1
+#endif
+
 struct PlayerInput {
     int   kind = 0;            /* 0=none, 1=keyboard, 2=controller */
     char  guid[40] = {0};      /* SDL joystick GUID string when kind==controller */
@@ -380,6 +396,18 @@ struct PlayerInput {
     uint8_t rumble_large = 0;
     bool    rumble_known = false;
     bool    rumble_warned = false;
+    /* Absolute SDL tick until which an active effect is left running. Games
+     * often pulse the motors (1,0,1,0 at 60 Hz); cancelling on every zero
+     * turned each pulse into a ~16 ms blip that cannot be felt. */
+    Uint64  rumble_hold_until = 0;
+    /* True when this slot's rumble is driven by the title HID writer instead
+     * of SDL (macOS DS4-family pads). */
+    bool    hid_rumble = false;
+    /* Set while an effect is latched on; cleared once the stop frame has been
+     * sent. Checking the previous frame's motor values instead (as this used
+     * to) never fires: by the time the hold expires the previous frame already
+     * reads zero, so a persistent host effect was left running forever. */
+    bool    rumble_stop_pending = false;
 };
 static PlayerInput g_players[PSX_MAX_PLAYERS];
 /* Offline SIO sample loop bound (from game.toml players; clamped). */
@@ -4284,6 +4312,12 @@ static void load_input_config(const char* argv0) {
 }
 
 static void close_player(PlayerInput& p) {
+#if defined(PSX_HAS_TITLE_RUMBLE_HOOK)
+    if (p.hid_rumble && psx_host_rumble_detach) {
+        psx_host_rumble_detach();
+        p.hid_rumble = false;
+    }
+#endif
     if (p.handle) {
         if (p.rumble_small || p.rumble_large)
             (void)SDL_GameControllerRumble(p.handle, 0, 0, 0);
@@ -4295,6 +4329,8 @@ static void close_player(PlayerInput& p) {
     p.rumble_large = 0;
     p.rumble_known = false;
     p.rumble_warned = false;
+    p.rumble_hold_until = 0;
+    p.rumble_stop_pending = false;
 }
 
 static void close_controller(void) {
@@ -4349,6 +4385,21 @@ static void open_player(PlayerInput& p, int self_slot) {
                      name ? name : "(unnamed)");
         p.rumble_known = false;
         p.rumble_warned = false;
+#if defined(PSX_HAS_TITLE_RUMBLE_HOOK)
+        p.hid_rumble = false;
+        if (psx_host_rumble_attach) {
+            const SDL_JoystickID inst_id = SDL_JoystickGetDeviceInstanceID(chosen);
+            p.hid_rumble = psx_host_rumble_attach(
+                               SDL_GetJoystickVendorForID(inst_id),
+                               SDL_GetJoystickProductForID(inst_id)) != 0;
+            if (p.hid_rumble)
+                std::fprintf(stdout,
+                    "psxrecomp runtime: slot %d rumble via title backend\n",
+                    self_slot + 1);
+        }
+#else
+        p.hid_rumble = false;
+#endif
     }
 }
 
@@ -4375,23 +4426,60 @@ static void update_controller_rumble(void) {
 
         const bool changed = !p.rumble_known || p.rumble_small != small ||
                              p.rumble_large != large;
-        if (small || large || (changed && p.rumble_known)) {
-            const Uint16 low_frequency = (Uint16)((unsigned)large * 257u);
-            const Uint16 high_frequency = small ? 0xFFFFu : 0u;
-#if defined(PSX_SDL3)
-            const int rc = SDL_GameControllerRumble(
-                p.handle, low_frequency, high_frequency,
-                (small || large) ? 100u : 0u) ? 0 : -1;
-#else
-            const int rc = SDL_GameControllerRumble(
-                p.handle, low_frequency, high_frequency,
-                (small || large) ? 100u : 0u);
+        /* Hold active effects for a short window and re-arm them on every frame
+         * that still reports a motor, instead of cancelling the moment a poll
+         * reads zero. A game that pulses its motors (BR2 writes small=1 on one
+         * poll and 0 on the next) then produces continuous vibration rather
+         * than one-frame blips; a finished effect stops kRumbleHoldMs after the
+         * last active poll. */
+        constexpr Uint64 kRumbleHoldMs = 250;
+        const bool active = (small || large) != 0;
+        const Uint64 now = SDL_GetTicks();
+        if (active) {
+            p.rumble_hold_until = now + kRumbleHoldMs;
+            p.rumble_stop_pending = true;
+        }
+        const bool stop_due =
+            !active && p.rumble_stop_pending && now >= p.rumble_hold_until;
+        if (stop_due) p.rumble_stop_pending = false;
+        if (active || stop_due) {
+            int rc = 0;
+#if defined(PSX_HAS_TITLE_RUMBLE_HOOK)
+            if (p.hid_rumble && psx_host_rumble_update) {
+                /* Raw PSX motor bytes (0..255) for this platform's writer. */
+                psx_host_rumble_update(active ? small : 0, active ? large : 0);
+            } else
 #endif
+            {
+                const Uint16 low_frequency =
+                    active ? (Uint16)((unsigned)large * 257u) : 0u;
+                const Uint16 high_frequency = (active && small) ? 0xFFFFu : 0u;
+#if defined(PSX_SDL3)
+                rc = SDL_GameControllerRumble(
+                    p.handle, low_frequency, high_frequency,
+                    active ? (Uint32)kRumbleHoldMs : 0u) ? 0 : -1;
+#else
+                rc = SDL_GameControllerRumble(
+                    p.handle, low_frequency, high_frequency,
+                    active ? (Uint32)kRumbleHoldMs : 0u);
+#endif
+            }
             if (rc != 0 && !p.rumble_warned) {
                 std::fprintf(stderr,
                     "psxrecomp runtime: controller for slot %d rejected rumble: %s\n",
                     s + 1, SDL_GetError());
                 p.rumble_warned = true;
+            }
+            if (trace && (changed || stop_due)) {
+                const unsigned low_dbg =
+                    active ? (unsigned)large * 257u : 0u;
+                const unsigned high_dbg = (active && small) ? 0xFFFFu : 0u;
+                std::fprintf(stdout,
+                    "psxrecomp rumble-hw: slot=%d low=%u high=%u dur=%u%s%s\n",
+                    s + 1, low_dbg, high_dbg,
+                    (unsigned)(active ? kRumbleHoldMs : 0u),
+                    p.hid_rumble ? " via=hid" : " via=sdl",
+                    stop_due ? " (stop)" : "");
             }
         }
         if (trace && changed) {
